@@ -1,0 +1,32 @@
+# sys-amneziawg : which hostnames travel through the tunnel
+#
+# Copy to /atmosphere/hosts/emummc_XXXXXXXX.txt, replacing XXXXXXXX with the
+# emummc id from /emuMMC/emummc.ini (the "id" field, without the 0x).
+# On a sysNAND setup, use default.txt instead.
+#
+# Replace 192.168.1.10 with the console's own LAN address, and reserve that
+# address on the router - a new DHCP lease breaks this file silently.
+#
+# Only the hostnames listed here go through the tunnel. Everything else is
+# untouched. A hostname listed here is unreachable while the tunnel is down.
+
+# Nintendo telemetry stays blocked. Atmosphere blocks it by default, but a
+# hosts file of your own is where that protection tends to get lost.
+127.0.0.1 receive-lp1.dg.srv.nintendo.net
+127.0.0.1 receive-lp1.er.srv.nintendo.net
+
+# Package downloads (aio-switch-updater and anything else pulling from GitHub)
+192.168.1.10 github.com
+192.168.1.10 api.github.com
+192.168.1.10 codeload.github.com
+192.168.1.10 raw.githubusercontent.com
+192.168.1.10 objects.githubusercontent.com
+192.168.1.10 release-assets.githubusercontent.com
+
+# YouTube
+192.168.1.10 youtube.com
+192.168.1.10 www.youtube.com
+192.168.1.10 m.youtube.com
+192.168.1.10 youtubei.googleapis.com
+192.168.1.10 i.ytimg.com
+192.168.1.10 *.googlevideo.com

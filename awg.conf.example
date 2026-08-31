@@ -1,0 +1,47 @@
+# sys-amneziawg tunnel configuration
+#
+# Export this from the AmneziaVPN client (AmneziaWG connection -> share ->
+# native WireGuard/AmneziaWG config) and copy it to the SD card as
+# /config/sys-amneziawg/awg.conf
+#
+# The keys below are placeholders. Never publish a real one: PrivateKey and
+# PresharedKey grant full access to your tunnel.
+#
+# Endpoint must be a literal IPv4 address. Hostnames are not resolved at
+# startup, because name resolution is only available once the tunnel is up.
+
+[Interface]
+Address = 10.0.0.2/32
+DNS = 1.1.1.1, 8.8.4.4
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
+# AmneziaWG obfuscation. Values must match the server exactly.
+Jc = 6
+Jmin = 10
+Jmax = 80
+S1 = 1113
+S2 = 600
+S3 = 599
+S4 = 12
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+
+# AmneziaWG 3.1 header protection. Omit if the server does not use it.
+HeaderProtectionKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+
+# Randomised timings, in seconds. A single value is accepted too.
+RekeyAfterTime = 100-120
+RekeyTimeout = 3-8
+RejectAfterTime = 150-180
+KeepaliveTimeout = 7-13
+MaxHandshakeAttempts = 15-20
+ContentPaddingAddition = 10-100
+
+[Peer]
+PublicKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+PresharedKey = DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 203.0.113.10:51820
+PersistentKeepalive = 25-35

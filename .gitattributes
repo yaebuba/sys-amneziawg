@@ -1,0 +1,12 @@
+# Vendored upstream code. Excluded from the language statistics so the bar
+# reflects what was written here rather than the size of lwIP.
+source/lwip/**   linguist-vendored
+source/crypto/** linguist-vendored
+
+# Ours, and written by hand.
+source/*.c            linguist-detectable
+source/*.h            linguist-detectable
+source/lwip_port/**   linguist-detectable
+
+# Keep line endings sane on every platform.
+* text=auto eol=lf

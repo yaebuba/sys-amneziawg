@@ -1,0 +1,23 @@
+sys-amneziawg
+Copyright (c) 2026 alik <yaebubas@gmail.com>
+
+This software is licensed under the GNU Affero General Public License,
+Version 3.0. See the LICENSE file for the full license text.
+
+--------------------------------------------------------------------------
+
+Third-party components redistributed in this repository:
+
+  source/lwip/          lwIP - A Lightweight TCP/IP stack
+                        Copyright (c) 2001-2004 Swedish Institute of
+                        Computer Science. BSD 3-Clause.
+                        https://savannah.nongnu.org/projects/lwip/
+
+  source/crypto/        Cryptographic primitives (X25519, ChaCha20-Poly1305,
+                        BLAKE2s, Poly1305) from wireguard-lwip.
+                        Copyright (c) 2021 Daniel Hope. BSD 3-Clause.
+                        https://github.com/smartalock/wireguard-lwip
+
+The AmneziaWG protocol was implemented from the reference behaviour of
+amneziawg-go (https://github.com/amnezia-vpn/amneziawg-go); no code was
+copied from it.

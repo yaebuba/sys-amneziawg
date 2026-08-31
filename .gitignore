@@ -1,0 +1,24 @@
+# Never commit a real tunnel configuration: it carries a live private key.
+*.conf
+!*.conf.example
+
+# Build output
+build/
+*.elf
+*.nso
+*.npdm
+*.nsp
+*.map
+awg-host
+*.dSYM/
+
+# Runtime logs pulled off the console
+*.log
+
+# Upstream sources fetched for reference, not part of this project
+ref/
+
+.DS_Store
+
+# Internal working notes, not part of the release
+BRIEF.md
