@@ -47,6 +47,21 @@
 #define CONF_PATH CFG_DIR "/awg.conf"
 #define LOG_PATH  CFG_DIR "/sys-amneziawg.log"
 
+/*
+ * Sleep diagnostic, stage 9 groundwork. Not a fix, and nothing depends on it.
+ *
+ * The question is narrow: does this process survive a suspend at all? The log
+ * cannot answer it. Its last line before the console slept was a failed
+ * sendto, and the resume marker never appeared - but a console that is powered
+ * off by holding the button leaves exactly the same silence as a module that
+ * died, so the log cannot tell the two apart.
+ *
+ * A file rewritten in place once a second can. Whatever it holds after the
+ * console comes back is the last moment the loop ran, to the second, and the
+ * loop counter beside it says whether the loop was turning or wedged.
+ */
+#define ALIVE_PATH CFG_DIR "/alive.txt"
+
 #define FETCH_EVERY_MS 300000   /* a liveness check, not the main event */
 
 u32 __nx_applet_type      = AppletType_None;
@@ -114,6 +129,46 @@ static void wait_for_network(void)
             return;
         svcSleepThread(2000000000ULL);
     }
+}
+
+/*
+ * Errors that mean this descriptor is finished and only a new one will do.
+ *
+ * A suspend leaves the old socket in exactly this state: EPIPE on every send,
+ * forever, because the console tore it down while it slept.
+ *
+ * ENETUNREACH and ENETDOWN are deliberately not here, though they arrive in
+ * the same breath. They say the network is missing, not the socket, and a
+ * fresh socket meets the identical error - after a resume Wi-Fi takes several
+ * seconds to reassociate, and a run that treated them as fatal rebuilt the
+ * tunnel thirty-nine times waiting for a link that simply had not come back
+ * yet. The cure for those is patience, which costs nothing.
+ */
+static bool sock_is_dead(int e)
+{
+    switch (e) {
+    case EPIPE: case EBADF: case ENOTCONN: case ENOTSOCK:
+    case ENETRESET: case ECONNABORTED: case ECONNRESET:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Rewritten, never appended: one line, always the current one. Cheap enough
+ * to do every second and small enough that a half-finished write cannot cost
+ * anything worth having.
+ */
+static void alive_mark(uint64_t mono_ms, uint64_t wall, uint64_t loops,
+                       const char *state)
+{
+    FILE *f = fopen(ALIVE_PATH, "w");
+    if (!f) return;
+    fprintf(f, "mono_ms=%llu wall=%llu loops=%llu state=%s\n",
+            (unsigned long long)mono_ms, (unsigned long long)wall,
+            (unsigned long long)loops, state);
+    fclose(f);
 }
 
 static uint64_t now_ms(void)
@@ -383,14 +438,67 @@ int main(int argc, char **argv)
             sess.rekey_after_s, sess.keepalive_s, sess.rekey_timeout_s);
 
     uint64_t start = now_ms();
-    uint64_t wall_at_start = awg_now_seconds();
     uint64_t next_fetch = 0, next_status = 0;
 
     uint32_t fetches = 0, fetches_ok = 0;
+    uint32_t stray_datagrams = 0;   /* arrived from somewhere that is not the peer */
     bool netif_up = false;
+
+    uint64_t loops = 0, next_alive = 0;
+    bool     tunnel_lost = false;   /* the socket died; rebuild it */
+    uint64_t unreachable_since = 0; /* first send refused for want of a network */
+    uint64_t next_rebuild = 0;      /* not before this, so a failure cannot spin */
+    uint32_t rebuilds = 0;
 
     while (!g_stop) {
         uint64_t now = now_ms();
+        loops++;
+
+        /*
+         * Recovery, and deliberately not "wake-up handling".
+         *
+         * There is no usable signal for a resume. Power events are out - psc:m
+         * hung the console - and the clock cannot stand in for them either:
+         * the monotonic counter keeps running while the console sleeps, so it
+         * stays in step with the wall clock and the drift this code used to
+         * watch for never appears. A forty-six second suspend went by without
+         * moving it a tick.
+         *
+         * What is observable is the socket: it comes back dead. So rebuild on
+         * that, and sleep, a dropped Wi-Fi link and a move into the dock are
+         * all the same event, none of which we have to be able to tell apart.
+         */
+        if (tunnel_lost && now >= next_rebuild) {
+            /* Set before anything can fail, so every path out of here waits. */
+            next_rebuild = now + 3000;
+
+            awg_proxy_stop();
+            if (fd >= 0) close(fd);
+            fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+            if (fd < 0) {
+                logf("[%3us] rebuild: socket() failed errno=%d, retrying\n",
+                        (uint32_t)((now - start) / 1000), errno);
+            } else {
+                rebuilds++;
+                /* lwIP keeps running: only the descriptor under it changed. */
+                awg_netif_set_fd(fd);
+                awg_session_init(&sess, &cfg);
+                http_reset();
+                g_http = HTTP_IDLE;
+                next_fetch = 0;
+                tunnel_lost = false;
+                logf("[%3us] tunnel rebuilt (#%u) - new socket, handshaking again\n",
+                        (uint32_t)((now - start) / 1000), rebuilds);
+
+                if (netif_up) {
+                    uint32_t resolver = cfg.dns_n > 1 ? cfg.dns[1] : cfg.dns[0];
+                    if (awg_proxy_start(443, resolver, LOG_PATH) != 0)
+                        logf("[%3us] rebuild: proxy failed to bind :443 (errno=%d)\n",
+                                (uint32_t)((now - start) / 1000), errno);
+                }
+            }
+        }
 
         /*
          * Resume detection by watching the clock rather than subscribing to
@@ -399,15 +507,10 @@ int main(int argc, char **argv)
          * nothing and cannot wedge anything.
          */
         uint64_t wall = awg_now_seconds();
-        int64_t drift = (int64_t)(wall - wall_at_start) - (int64_t)((now - start) / 1000);
-        if (drift > 30) {
-            logf("[%3us] resumed after ~%llds asleep - reconnecting\n",
-                    (uint32_t)((now - start) / 1000), (long long)drift);
-            awg_session_init(&sess, &cfg);
-            http_reset();
-            g_http = HTTP_IDLE;
-            wall_at_start = wall - (now - start) / 1000;
-            next_fetch = 0;
+
+        if (now >= next_alive) {
+            next_alive = now + 1000;
+            alive_mark(now, wall, loops, netif_up ? "up" : "down");
         }
 
         if (awg_session_needs_handshake(&sess, &cfg, now)) {
@@ -423,10 +526,40 @@ int main(int argc, char **argv)
 
                 int sr = sendto(fd, g_wire, (size_t)n, 0,
                                 (struct sockaddr *)&dst, sizeof(dst));
-                logf("[%3us] handshake %s attempt %d: sendto=%d\n",
+                /* errno matters here: a suspend takes the network out from
+                 * under this socket, and which error it returns says whether
+                 * the socket is merely unusable or gone for good. */
+                int se = sr < 0 ? errno : 0;
+                logf("[%3us] handshake %s attempt %d: sendto=%d errno=%d\n",
                         (uint32_t)((now - start) / 1000),
                         sess.established ? "rekey" : "initial",
-                        sess.handshake_tries, sr);
+                        sess.handshake_tries, sr, se);
+                if (sr >= 0) {
+                    unreachable_since = 0;
+                } else if (sock_is_dead(se)) {
+                    if (!tunnel_lost) {
+                        logf("[%3us] send failed fatally - rebuilding the tunnel\n",
+                                (uint32_t)((now - start) / 1000));
+                        tunnel_lost = true;
+                    }
+                } else if (se == ENETUNREACH || se == ENETDOWN) {
+                    /*
+                     * Waiting for the link is right, but not forever. This
+                     * socket was opened while the network was missing, and
+                     * nothing proves such a socket starts working once the
+                     * link returns. After half a minute of refusals, spend
+                     * one rebuild to rule that out.
+                     */
+                    if (unreachable_since == 0) {
+                        unreachable_since = now;
+                    } else if (now - unreachable_since > 30000 && !tunnel_lost) {
+                        logf("[%3us] no network for %llus - rebuilding once to be sure\n",
+                                (uint32_t)((now - start) / 1000),
+                                (unsigned long long)((now - unreachable_since) / 1000));
+                        tunnel_lost = true;
+                        unreachable_since = 0;
+                    }
+                }
             }
         } else if (awg_session_needs_keepalive(&sess, now)) {
             int n = awg_session_build_keepalive(&sess, &cfg, g_wire,
@@ -485,11 +618,66 @@ int main(int argc, char **argv)
          * invisible while we only sent a DNS probe every ten seconds and
          * became a wall the moment something tried to download.
          */
-        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
-        if (poll(&p, 1, 1) > 0) {
+        /*
+         * One wait for both halves of the module.
+         *
+         * Until this was merged, the loop waited a millisecond on the tunnel
+         * socket, then another millisecond inside the proxy, and Horizon
+         * returned from both far sooner than asked: an idle module turned
+         * over 4800 times a second and burned a core for nothing. A hundred
+         * milliseconds is a real sleep, and it costs no latency, because the
+         * wait ends the moment any descriptor has something to say. lwIP's
+         * timers tolerate it comfortably - they need servicing a few times a
+         * second, not a few thousand.
+         */
+        short udp_revents = 0;
+        if (fd < 0) {
+            /* Nothing to wait on: hold still rather than spin on nothing. */
+            svcSleepThread(100000000ULL);
+        } else if (netif_up) {
+            awg_proxy_poll(100, fd, &udp_revents);
+        } else {
+            struct pollfd pw = { .fd = fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pw, 1, 100) > 0) udp_revents = pw.revents;
+        }
+
+        if (udp_revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (!tunnel_lost) {
+                logf("[%3us] tunnel socket died (revents=0x%x) - rebuilding\n",
+                        (uint32_t)((now - start) / 1000), (unsigned)udp_revents);
+                tunnel_lost = true;
+                /*
+                 * next_rebuild is left alone on purpose. Clearing it here to
+                 * react faster is what turned the spacing below into a
+                 * suggestion: detection would cancel the very delay the last
+                 * rebuild had just set, and attempts came in bursts of eight.
+                 */
+            }
+        }
+
+        if (udp_revents & POLLIN) {
             for (int drained = 0; drained < 64; drained++) {
-                int rn = (int)recv(fd, g_rx, sizeof(g_rx), MSG_DONTWAIT);
+                /*
+                 * recvfrom, and the source is checked: the socket is not
+                 * connected, so the console will hand us datagrams from
+                 * anybody who cares to send them. The AEAD stops those from
+                 * being believed, but only after we have paid for a
+                 * decryption attempt against two keypairs - a cost anyone on
+                 * the path can impose at will. Comparing four bytes first is
+                 * free, and it is the filter WireGuard itself applies.
+                 */
+                struct sockaddr_in from;
+                socklen_t from_len = sizeof(from);
+                int rn = (int)recvfrom(fd, g_rx, sizeof(g_rx), MSG_DONTWAIT,
+                                       (struct sockaddr *)&from, &from_len);
                 if (rn <= 0) break;
+
+                if (from_len < (socklen_t)sizeof(from) ||
+                    from.sin_addr.s_addr != dst.sin_addr.s_addr ||
+                    from.sin_port != dst.sin_port) {
+                    stray_datagrams++;
+                    continue;
+                }
 
                 int plen = 0;
                 uint64_t t = now_ms();
@@ -509,8 +697,6 @@ int main(int argc, char **argv)
         /* lwIP has no thread of its own; its timers only run when we ask. */
         awg_netif_poll();
 
-        if (netif_up) awg_proxy_poll(1);
-
         if (now_ms() >= next_status) {
             uint64_t t = now_ms();
             awg_proxy_stats ps;
@@ -525,7 +711,8 @@ int main(int argc, char **argv)
             last_down_kb = (uint32_t)(ps.bytes_down / 1024);
             logf("[%3us] up=%us tx=%u rx=%u ka=%u fetches %u/%u | "
                          "proxy conns=%u ok=%u fail=%u closed=%u live=%u/%u "
-                         "deny=%u full=%u idle=%u up=%lluKB down=%lluKB\n",
+                         "deny=%u full=%u idle=%u up=%lluKB down=%lluKB "
+                         "loops=%llu stray=%u replay=%u\n",
                     (uint32_t)((t - start) / 1000),
                     awg_session_age_s(&sess, t),
                     sess.packets_tx, sess.packets_rx, sess.keepalives_tx,
@@ -534,7 +721,9 @@ int main(int argc, char **argv)
                     awg_proxy_live(), (uint32_t)AWG_PROXY_MAX_CONN,
                     ps.denied, ps.refused, ps.timed_out,
                     (unsigned long long)(ps.bytes_up / 1024),
-                    (unsigned long long)(ps.bytes_down / 1024));
+                    (unsigned long long)(ps.bytes_down / 1024),
+                    (unsigned long long)loops, stray_datagrams,
+                    sess.replays_dropped);
 
             /*
              * Only once lwIP is actually running: its statistics pointers are
@@ -587,6 +776,14 @@ int main(int argc, char **argv)
 
 done:
     awg_config_free(&cfg);
+    /*
+     * The module does not exit here - it parks below - so the private key,
+     * the preshared key and the live session keys would otherwise sit in
+     * memory for as long as the console stays on, long after the tunnel they
+     * belonged to is gone.
+     */
+    awg_session_wipe(&sess);
+    memset(&cfg, 0, sizeof(cfg));
     logf("\ndone.\n");
 
     while (!g_stop) svcSleepThread(10000000000ULL);

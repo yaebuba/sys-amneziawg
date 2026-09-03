@@ -369,6 +369,47 @@ static void pump_down(conn_t *c)
 }
 
 /*
+ * Normalises a hostname out of a ClientHello, or rejects it.
+ *
+ * Everything here arrives from whatever opened the socket, and two things go
+ * wrong if it is taken at face value.
+ *
+ * A trailing dot walks straight through the deny list below. DNS treats
+ * "srv.nintendo.net." and "srv.nintendo.net" as the same name, but a suffix
+ * comparison does not, so the dotted form would have been tunnelled - taking
+ * Nintendo's telemetry with it, which is the one thing that list exists to
+ * stop. The dot is stripped before anything else looks at the name.
+ *
+ * And the name reaches the log, where a newline would let a caller forge
+ * entries, and the resolver, which has no business seeing arbitrary bytes.
+ * So the character set is the one hostnames are actually made of, and
+ * anything else is refused rather than sanitised - a name we had to repair
+ * is a name we do not want to visit.
+ */
+static bool host_normalise(char *h)
+{
+    size_t n = strlen(h);
+
+    while (n > 0 && h[n - 1] == '.') h[--n] = 0;     /* the FQDN dot */
+    if (n == 0 || n > 253) return false;
+
+    bool label_empty = true;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)h[i];
+        if (c == '.') {
+            if (label_empty) return false;           /* ".." or a leading dot */
+            label_empty = true;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            return false;
+        label_empty = false;
+    }
+    return !label_empty;                             /* it ended on a dot */
+}
+
+/*
  * Hostnames we refuse to carry, whatever the hosts file says.
  *
  * Atmosphere blackholes Nintendo's telemetry by pointing it at 127.0.0.1,
@@ -421,6 +462,13 @@ static void handle_client_readable(conn_t *c)
 
     if (c->st == ST_SNIFF) {
         if (sni_hostname(c->up, c->up_len, c->host, sizeof(c->host)) > 0) {
+            if (!host_normalise(c->host)) {
+                g_stats.denied++;
+                c->host[0] = 0;         /* never log what we would not visit */
+                conn_close(c, "denied: malformed hostname");
+                return;
+            }
+
             LOGP("        proxy: %s\n", c->host);
 
             if (host_denied(c->host)) {
@@ -508,17 +556,48 @@ static void sweep_idle(void)
     }
 }
 
-void awg_proxy_poll(int timeout_ms)
+void awg_proxy_poll(int timeout_ms, int extra_fd, short *extra_revents)
 {
-    if (g_listen < 0) return;
+    if (extra_revents) *extra_revents = 0;
 
-    struct pollfd fds[MAX_CONN + 1];
-    conn_t *owner[MAX_CONN + 1];
+    /*
+     * Returning early here would hand the caller a wait that does not wait.
+     * The listener can be down while the tunnel is up - a failed bind, or a
+     * stop() - and the loop would then spin at full speed on nothing, which
+     * is the exact fault this signature exists to cure. Wait on the caller's
+     * descriptor instead and let it get on with its half.
+     */
+    if (g_listen < 0) {
+        if (extra_fd < 0) return;
+        struct pollfd pw = { .fd = extra_fd, .events = POLLIN, .revents = 0 };
+        if (poll(&pw, 1, timeout_ms) > 0 && extra_revents)
+            *extra_revents = pw.revents;
+        return;
+    }
+
+    struct pollfd fds[MAX_CONN + 2];
+    conn_t *owner[MAX_CONN + 2];
     int nf = 0;
 
     fds[nf].fd = g_listen; fds[nf].events = POLLIN; fds[nf].revents = 0;
     owner[nf] = NULL;
     nf++;
+
+    /*
+     * The tunnel's own socket waits here too, so the loop has exactly one
+     * place where it sleeps. Two consecutive one-millisecond waits is what
+     * turned an idle module into a 4800-per-second spin: neither was long
+     * enough to be a wait, and between them the loop never yielded.
+     */
+    int extra_slot = -1;
+    if (extra_fd >= 0) {
+        extra_slot = nf;
+        fds[nf].fd = extra_fd; fds[nf].events = POLLIN; fds[nf].revents = 0;
+        owner[nf] = NULL;
+        nf++;
+    }
+
+    const int n_head = nf;      /* slots below this are not connections */
 
     for (int i = 0; i < MAX_CONN; i++) {
         conn_t *c = &g_conn[i];
@@ -534,7 +613,29 @@ void awg_proxy_poll(int timeout_ms)
         nf++;
     }
 
+    /*
+     * One thing here is not driven by a descriptor: bytes parked in `up`
+     * waiting on lwIP's send window, which opens when an ACK arrives rather
+     * than when a socket turns readable. Sleeping the whole timeout with data
+     * pending would stall the upstream direction, so shorten the wait to a
+     * tick whenever any connection is holding some.
+     */
+    for (int i = 0; i < MAX_CONN; i++)
+        if (g_conn[i].st != ST_FREE && g_conn[i].up_len > 0) {
+            if (timeout_ms > 5) timeout_ms = 5;
+            break;
+        }
+
     if (poll(fds, (nfds_t)nf, timeout_ms) > 0) {
+        /*
+         * Handed back whole, errors included. Reporting only POLLIN would
+         * hide a dead socket, and a dead socket is exactly what poll returns
+         * from instantly and forever - the caller must be able to see it to
+         * do anything but spin.
+         */
+        if (extra_slot >= 0 && extra_revents)
+            *extra_revents = fds[extra_slot].revents;
+
         if (fds[0].revents & POLLIN) {
             int cfd = accept(g_listen, NULL, NULL);
             if (cfd >= 0) {
@@ -552,7 +653,7 @@ void awg_proxy_poll(int timeout_ms)
             }
         }
 
-        for (int i = 1; i < nf; i++) {
+        for (int i = n_head; i < nf; i++) {
             conn_t *c = owner[i];
             if (!c || c->st == ST_FREE) continue;
             if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {

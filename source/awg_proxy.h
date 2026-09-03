@@ -45,7 +45,16 @@ int awg_proxy_start(uint16_t port, uint32_t dns_server,
  * Call it from the main loop alongside awg_netif_poll(). Never blocks for
  * longer than `timeout_ms`.
  */
-void awg_proxy_poll(int timeout_ms);
+/*
+ * Waits in one place for both halves of the module: the console-side sockets
+ * it owns, and `extra_fd` - the tunnel's UDP socket - so the caller never has
+ * to add a second wait of its own. Pass -1 for none.
+ *
+ * `extra_revents` receives that descriptor's revents verbatim, errors and
+ * hangups included. Watching only POLLIN there is how a dead socket turns
+ * into a busy loop: poll returns from it immediately, every time, forever.
+ */
+void awg_proxy_poll(int timeout_ms, int extra_fd, short *extra_revents);
 
 /* Slots currently in use, out of the fixed table. */
 uint32_t awg_proxy_live(void);

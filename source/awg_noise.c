@@ -16,6 +16,7 @@
 
 #include "awg_noise.h"
 #include "crypto/blake2s.h"
+#include "crypto/crypto.h"
 #include "crypto/chacha20.h"
 #include "crypto/chacha20poly1305.h"
 #include "crypto/x25519.h"
@@ -217,7 +218,9 @@ int awg_consume_initiation(awg_handshake *hs, const uint8_t in[AWG_MSG_INIT_SIZE
     chain_start(hs, hs->s_pub);
 
     mac1(expect, hs->s_pub, in, 116);
-    if (memcmp(expect, in + 116, 16) != 0) return -1;
+    /* Constant time: a MAC check that leaks where it stopped matching
+     * is a MAC check that can be walked byte by byte. */
+    if (!crypto_equal(expect, in + 116, 16)) return -1;
 
     hs->remote_index = get_u32_le(in + 4);
     memcpy(hs->peer_eph, in + 8, 32);
@@ -285,7 +288,7 @@ int awg_consume_response(awg_handshake *hs, const uint8_t in[AWG_MSG_RESP_SIZE])
     if (get_u32_le(in + 8) != hs->local_index) return -1;
 
     mac1(expect, hs->s_pub, in, 60);
-    if (memcmp(expect, in + 60, 16) != 0) return -1;
+    if (!crypto_equal(expect, in + 60, 16)) return -1;
 
     hs->remote_index = get_u32_le(in + 4);
     memcpy(hs->peer_eph, in + 12, 32);

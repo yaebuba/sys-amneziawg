@@ -32,6 +32,13 @@ typedef enum {
     AWG_RX_ESTABLISHED    /* a handshake completed; the tunnel is up     */
 } awg_rx_result;
 
+/*
+ * How long a retired keypair stays able to decrypt. WireGuard's own limit is
+ * three minutes; the only packets it needs to cover are those already in
+ * flight when the rekey happened.
+ */
+#define AWG_PREV_KEEP_MS (180 * 1000ULL)
+
 typedef struct {
     awg_handshake cur;              /* the live keypair                      */
     bool          established;
@@ -53,6 +60,27 @@ typedef struct {
     uint64_t      tx_counter;       /* never repeats for a key - it is the
                                      * AEAD nonce                            */
     uint64_t      rx_counter_max;
+
+    /*
+     * Anti-replay, RFC 6479 style: the highest counter accepted so far and a
+     * bitmap of the window below it.
+     *
+     * The AEAD proves a datagram came from the peer. It says nothing about
+     * whether we have seen it before, and without this a captured packet can
+     * be sent back at us forever - decrypting cleanly every time, and being
+     * handed to lwIP as fresh data every time. WireGuard requires the window
+     * for exactly that reason.
+     *
+     * One window per keypair, because the counter restarts at zero on every
+     * rekey and a shared window would reject the new keypair's first packets
+     * as ancient.
+     */
+    uint64_t      rx_window_max;
+    uint64_t      rx_window_bits;
+    uint64_t      prev_window_max;
+    uint64_t      prev_window_bits;
+    uint64_t      prev_since_ms;    /* when the old keypair was retired */
+    uint32_t      replays_dropped;  /* datagrams that decrypted but repeated */
 
     uint64_t      established_ms;
     uint64_t      last_tx_ms;
@@ -102,6 +130,8 @@ int awg_session_build_keepalive(awg_session *s, const awg_config *cfg,
  * Feeds a received datagram in. On AWG_RX_PAYLOAD, `payload` holds the inner
  * packet and `*payload_len` its length. `pkt` is modified in place.
  */
+void awg_session_wipe(awg_session *s);
+
 awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
                                       uint8_t *pkt, int pkt_len,
                                       uint8_t *payload, int payload_cap,

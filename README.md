@@ -219,6 +219,12 @@ not in archives. It is excluded by `.gitignore`.
 
 Session keys are never written to the log.
 
+**The log records every hostname you visit through the tunnel.** That is a list
+of the sites the console opened, and it is there because the module is still
+being debugged. Read it before sending it to anyone, and strip the `proxy:`
+lines if you would rather not share your browsing. The log is rewritten from
+scratch on every boot, so it never grows into a long history.
+
 ## Credits
 
 Written by alik. Parts of the implementation were done together with Claude, an

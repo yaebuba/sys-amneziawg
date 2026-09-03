@@ -114,6 +114,11 @@ int awg_netif_start(const awg_config *cfg, awg_session *sess,
     return 0;
 }
 
+void awg_netif_set_fd(int fd)
+{
+    g_fd = fd;
+}
+
 void awg_netif_input(const uint8_t *packet, int len)
 {
     if (!g_ready || len <= 0) return;

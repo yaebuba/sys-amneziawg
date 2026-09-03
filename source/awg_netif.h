@@ -33,6 +33,17 @@ int awg_netif_start(const awg_config *cfg, awg_session *sess,
                     int fd, const void *peer_sockaddr, int peer_len);
 
 /* Hands a decrypted inner IP packet to the stack. */
+/*
+ * Hands the interface a replacement socket after the old one dies.
+ *
+ * Deliberately not awg_netif_start() again: that calls lwip_init() and
+ * netif_add(), and doing either a second time on a running stack corrupts it.
+ * Only the descriptor underneath changes when a suspend or a lost link takes
+ * the socket away - the interface, its address and every pcb on it are still
+ * perfectly good.
+ */
+void awg_netif_set_fd(int fd);
+
 void awg_netif_input(const uint8_t *packet, int len);
 
 /*

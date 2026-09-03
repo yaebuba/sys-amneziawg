@@ -101,6 +101,47 @@ int awg_session_build_keepalive(awg_session *s, const awg_config *cfg,
     return n;
 }
 
+/* Erases every key this session held. */
+void awg_session_wipe(awg_session *s)
+{
+    memset(s, 0, sizeof(*s));
+}
+
+/*
+ * RFC 6479 sliding window.
+ *
+ * Returns false for a counter already seen, or one so far behind the highest
+ * accepted that we can no longer prove it is fresh. Both are dropped: a
+ * datagram that cannot be shown to be new is indistinguishable from a replay,
+ * and treating it as new is exactly the hole.
+ *
+ * The window is 64 wide, which tolerates the reordering a tunnel actually
+ * produces while keeping the state to two words per keypair.
+ */
+#define REPLAY_WINDOW 64
+
+static bool replay_ok(uint64_t *max, uint64_t *bits, uint64_t ctr)
+{
+    if (ctr > *max) {
+        uint64_t shift = ctr - *max;
+        /* Shifting by 64 or more is undefined in C, and a long gap means
+         * nothing below the new counter is worth remembering anyway. */
+        *bits = shift >= REPLAY_WINDOW ? 0 : (*bits << shift);
+        *bits |= 1;
+        *max   = ctr;
+        return true;
+    }
+
+    uint64_t behind = *max - ctr;
+    if (behind >= REPLAY_WINDOW) return false;      /* too old to judge */
+
+    uint64_t bit = 1ULL << behind;
+    if (*bits & bit) return false;                  /* seen it already */
+
+    *bits |= bit;
+    return true;
+}
+
 awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
                                       uint8_t *pkt, int pkt_len,
                                       uint8_t *payload, int payload_cap,
@@ -127,6 +168,9 @@ awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
             s->rekeys++;
             s->prev      = s->cur;      /* keep it for late arrivals */
             s->have_prev = true;
+            s->prev_window_max  = s->rx_window_max;
+            s->prev_window_bits = s->rx_window_bits;
+            s->prev_since_ms    = now_ms;
         }
         s->cur            = s->pending;
         s->established    = true;
@@ -134,6 +178,8 @@ awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
         s->handshake_tries = 0;
         s->tx_counter     = 0;
         s->rx_counter_max = 0;
+        s->rx_window_max  = 0;
+        s->rx_window_bits = 0;
         s->established_ms = now_ms;
         s->last_rx_ms     = now_ms;
         s->last_tx_ms     = now_ms;
@@ -143,17 +189,44 @@ awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
 
     if (!s->established) return AWG_RX_IGNORED;
 
+    /*
+     * The previous keypair is only kept for packets that were already on the
+     * wire when the rekey happened. Holding it indefinitely leaves retired
+     * keys able to decrypt, which is the opposite of what a rekey is for.
+     */
+    if (s->have_prev && now_ms - s->prev_since_ms > AWG_PREV_KEEP_MS) {
+        s->have_prev = false;
+        memset(&s->prev, 0, sizeof(s->prev));
+        s->prev_window_max = s->prev_window_bits = 0;
+    }
+
     uint64_t ctr = 0;
     int plain = awg_transport_open(cfg, &s->cur, pkt, pkt_len,
                                    payload, payload_cap, &ctr);
+    bool on_prev = false;
 
     /* Anything still in flight under the old keys is worth decrypting rather
      * than making TCP discover the loss the slow way. */
-    if (plain < 0 && s->have_prev)
+    if (plain < 0 && s->have_prev) {
         plain = awg_transport_open(cfg, &s->prev, pkt, pkt_len,
                                    payload, payload_cap, &ctr);
+        on_prev = plain >= 0;
+    }
 
     if (plain < 0) return AWG_RX_IGNORED;
+
+    /* Authenticated, but not yet proven new. */
+    if (on_prev) {
+        if (!replay_ok(&s->prev_window_max, &s->prev_window_bits, ctr)) {
+            s->replays_dropped++;
+            return AWG_RX_IGNORED;
+        }
+    } else {
+        if (!replay_ok(&s->rx_window_max, &s->rx_window_bits, ctr)) {
+            s->replays_dropped++;
+            return AWG_RX_IGNORED;
+        }
+    }
 
     s->last_rx_ms = now_ms;
     if (ctr > s->rx_counter_max) s->rx_counter_max = ctr;
