@@ -14,6 +14,7 @@
  * that gap: bytes are parked until the other side is ready to take them.
  */
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
@@ -29,6 +30,7 @@
 #include "lwip/tcp.h"
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
+#include "lwip/sys.h"
 
 #define MAX_CONN 16
 #define BUF_SIZE 8192
@@ -36,6 +38,22 @@
 /* A ClientHello that has not produced a hostname by this many bytes is not
  * going to; something other than TLS is talking to us. */
 #define SNIFF_LIMIT 2048
+
+/*
+ * Two idle timeouts, because a slot is only freed when somebody says so and
+ * TCP has no way of saying "the other end vanished". An application killed
+ * from the home menu, a Wi-Fi drop, a console going to sleep - none of them
+ * send a FIN, so without a clock those slots are gone until the module is
+ * restarted. There are sixteen of them.
+ *
+ * The two numbers are far apart on purpose. A client that has connected owes
+ * us a ClientHello immediately, so waiting seconds for it is already
+ * generous. A relayed connection, on the other hand, is allowed to go quiet
+ * for a long time - browsers and video players keep sockets open between
+ * requests, and closing one out from under them costs a reconnect.
+ */
+#define SNIFF_TIMEOUT_MS   5000
+#define IDLE_TIMEOUT_MS  120000
 
 typedef enum {
     ST_FREE = 0,
@@ -51,6 +69,7 @@ typedef struct {
     struct tcp_pcb *pcb;        /* the real connection, tunnel side       */
 
     char   host[128];
+    u32_t  last_ms;     /* sys_now() when a byte last moved, either direction */
 
     uint8_t up[BUF_SIZE];       /* console -> tunnel, awaiting send       */
     int     up_len;
@@ -74,7 +93,27 @@ typedef struct {
 } conn_t;
 
 static conn_t  g_conn[MAX_CONN];
-static int     g_listen = -1;
+
+/*
+ * One listener, on the loopback address.
+ *
+ * Horizon delivers cross-process connections to 127.0.0.1 - proven on
+ * hardware, for GitHub and for YouTube's whole spread of CDN names - and
+ * that address exists no matter which network the console is on. A hosts
+ * file pointing here survives a new DHCP lease, the dock's wired link and a
+ * phone hotspot, none of which the console's LAN address survives.
+ *
+ * The LAN address was tried first and is deliberately gone. While it was
+ * bound, anything else on the same Wi-Fi could open port 443 on the console
+ * and be handed a proxy straight into the tunnel.
+ *
+ * The rest of 127.0.0.0/8 is not available: Horizon assigns the loopback
+ * interface exactly one address, and bind() to 127.0.0.77 is refused. That
+ * is a shame, because it means "route this through the tunnel" and "throw
+ * this away", which hosts files both write as 127.0.0.1, cannot be told
+ * apart by address. host_denied() is what separates them instead.
+ */
+static int g_listen = -1;
 static uint32_t g_dns_server;
 static const char *g_log_path;
 static awg_proxy_stats g_stats;
@@ -171,7 +210,16 @@ static void conn_close(conn_t *c, const char *why)
     if (c->rx_head) { pbuf_free(c->rx_head); c->rx_head = NULL; c->rx_off = 0; }
     if (c->cfd >= 0) { close(c->cfd); c->cfd = -1; }
 
-    if (why && c->host[0]) LOGP("        proxy: %s (%s)\n", c->host, why);
+    /*
+     * Counted here rather than at each call site, because the arithmetic is
+     * the point: accepted must equal completed + failed + closed + live.
+     * While closes went uncounted, a healthy run looked like it was leaking
+     * half the table, and the missing slots were chased instead of the bug.
+     */
+    if (why) {
+        g_stats.closed++;
+        if (c->host[0]) LOGP("        proxy: %s (%s)\n", c->host, why);
+    }
 
     memset(c, 0, sizeof(*c));
     c->cfd = -1;
@@ -280,6 +328,7 @@ static void pump_up(conn_t *c)
 
     memmove(c->up, c->up + n, (size_t)(c->up_len - n));
     c->up_len -= n;
+    c->last_ms = sys_now();
     g_stats.bytes_up += (uint32_t)n;
 }
 
@@ -306,6 +355,7 @@ static void pump_down(conn_t *c)
         int n = (int)send(c->cfd, (uint8_t *)p->payload + c->rx_off, (size_t)avail, 0);
         if (n > 0) {
             c->rx_off += (u16_t)n;
+            c->last_ms = sys_now();
             g_stats.bytes_down += (uint32_t)n;
             /* Acknowledge only now: the window reopens exactly as fast as the
              * application drinks, which is the flow control we want. */
@@ -316,6 +366,36 @@ static void pump_down(conn_t *c)
         conn_close(c, "client write failed");
         return;
     }
+}
+
+/*
+ * Hostnames we refuse to carry, whatever the hosts file says.
+ *
+ * Atmosphere blackholes Nintendo's telemetry by pointing it at 127.0.0.1,
+ * which works only because nothing listens there. The moment we bind that
+ * address we inherit those connections, and relaying them would both undo
+ * the block and deliver the reports from the tunnel's exit address instead
+ * of the console's. Neither is something the user asked for.
+ *
+ * The match is on the name suffix, so a name has to end at a label boundary:
+ * "evil-nintendo.net" is not "nintendo.net".
+ */
+static const char *const g_deny_suffix[] = {
+    "nintendo.net",
+    "nintendo.com",
+    "nintendo.co.jp",
+};
+
+static bool host_denied(const char *host)
+{
+    size_t hl = strlen(host);
+    for (size_t i = 0; i < sizeof(g_deny_suffix) / sizeof(*g_deny_suffix); i++) {
+        size_t sl = strlen(g_deny_suffix[i]);
+        if (hl < sl) continue;
+        if (strcasecmp(host + hl - sl, g_deny_suffix[i]) != 0) continue;
+        if (hl == sl || host[hl - sl - 1] == '.') return true;
+    }
+    return false;
 }
 
 static void handle_client_readable(conn_t *c)
@@ -337,10 +417,17 @@ static void handle_client_readable(conn_t *c)
     }
 
     c->up_len += n;
+    c->last_ms = sys_now();
 
     if (c->st == ST_SNIFF) {
         if (sni_hostname(c->up, c->up_len, c->host, sizeof(c->host)) > 0) {
             LOGP("        proxy: %s\n", c->host);
+
+            if (host_denied(c->host)) {
+                g_stats.denied++;
+                conn_close(c, "denied: telemetry stays blocked");
+                return;
+            }
 
             ip_addr_t ip;
             c->st = ST_RESOLVING;
@@ -355,7 +442,31 @@ static void handle_client_readable(conn_t *c)
 
 /* ------------------------------------------------------------------- api */
 
-int awg_proxy_start(uint32_t bind_ip, uint16_t port, uint32_t dns_server,
+static int open_listener(uint32_t ip, uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons(port);
+    sa.sin_addr.s_addr = ip;    /* never INADDR_ANY: Horizon will not
+                                 * deliver connections to it */
+
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+        listen(fd, MAX_CONN) < 0) {
+        close(fd);
+        return -1;
+    }
+    set_nonblock(fd);
+    return fd;
+}
+
+int awg_proxy_start(uint16_t port, uint32_t dns_server,
                     const char *log_path)
 {
     g_log_path   = log_path;
@@ -370,27 +481,31 @@ int awg_proxy_start(uint32_t bind_ip, uint16_t port, uint32_t dns_server,
     dns.addr = dns_server;
     dns_setserver(0, &dns);
 
-    g_listen = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_listen < 0) return -1;
+    g_listen = open_listener(htonl(INADDR_LOOPBACK), port);
+    return g_listen >= 0 ? 0 : -1;
+}
 
-    int yes = 1;
-    setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+/*
+ * Closes whatever has stopped talking. Called once per poll; the cost is a
+ * walk of sixteen entries, and it is the only thing that ever reclaims a
+ * slot whose client disappeared without saying goodbye.
+ */
+static void sweep_idle(void)
+{
+    u32_t now = sys_now();
+    for (int i = 0; i < MAX_CONN; i++) {
+        conn_t *c = &g_conn[i];
+        if (c->st == ST_FREE) continue;
 
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family      = AF_INET;
-    sa.sin_port        = htons(port);
-    sa.sin_addr.s_addr = bind_ip;    /* never INADDR_ANY: Horizon will not
-                                      * deliver connections to it */
+        /* Unsigned subtraction, so the 49-day wrap of sys_now() is harmless. */
+        u32_t idle  = now - c->last_ms;
+        u32_t limit = c->st == ST_SNIFF ? SNIFF_TIMEOUT_MS : IDLE_TIMEOUT_MS;
+        if (idle < limit) continue;
 
-    if (bind(g_listen, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(g_listen); g_listen = -1; return -1;
+        g_stats.timed_out++;
+        conn_close(c, c->st == ST_SNIFF ? "no ClientHello in time"
+                                        : "idle too long");
     }
-    if (listen(g_listen, MAX_CONN) < 0) {
-        close(g_listen); g_listen = -1; return -1;
-    }
-    set_nonblock(g_listen);
-    return 0;
 }
 
 void awg_proxy_poll(int timeout_ms)
@@ -426,10 +541,12 @@ void awg_proxy_poll(int timeout_ms)
                 conn_t *c = conn_alloc();
                 if (!c) {
                     close(cfd);              /* table full: refuse politely */
+                    g_stats.refused++;
                 } else {
                     set_nonblock(cfd);
-                    c->cfd = cfd;
-                    c->st  = ST_SNIFF;
+                    c->cfd     = cfd;
+                    c->st      = ST_SNIFF;
+                    c->last_ms = sys_now();
                     g_stats.accepted++;
                 }
             }
@@ -446,6 +563,8 @@ void awg_proxy_poll(int timeout_ms)
             if (c->st != ST_FREE && (fds[i].revents & POLLIN)) handle_client_readable(c);
         }
     }
+
+    sweep_idle();
 
     /* Regardless of poll: lwIP may have handed us data or freed send window
      * since the last pass. */
@@ -469,6 +588,14 @@ void awg_proxy_stop(void)
 {
     for (int i = 0; i < MAX_CONN; i++) conn_close(&g_conn[i], NULL);
     if (g_listen >= 0) { close(g_listen); g_listen = -1; }
+}
+
+uint32_t awg_proxy_live(void)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < MAX_CONN; i++)
+        if (g_conn[i].st != ST_FREE) n++;
+    return n;
 }
 
 void awg_proxy_get_stats(awg_proxy_stats *out)

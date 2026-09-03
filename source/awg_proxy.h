@@ -24,15 +24,20 @@
 #include <stdio.h>
 
 /*
- * Binds the listener. `bind_ip` is the console's own LAN address in network
- * order - Horizon does not deliver connections to a socket bound to
- * INADDR_ANY, so the address has to be the specific one dns.mitm points at.
+ * Binds the listener on 127.0.0.1, where hosts files should point.
+ *
+ * Horizon delivers cross-process connections to loopback, and that address
+ * is the same on every network - which is what makes the dock, a new DHCP
+ * lease and a phone hotspot survivable. `bind_ip`, the console's LAN
+ * address, is gone from the signature: binding it turned the console into
+ * an open proxy for everything else on the same Wi-Fi. The rest of 127.0.0.0/8 is
+ * not available; Horizon gives loopback exactly one address.
  *
  * Returns 0 on success.
  */
 /* `log_path` is reopened per line rather than held: a console powered off at
  * the wall must not take the tail of the log with it. */
-int awg_proxy_start(uint32_t bind_ip, uint16_t port, uint32_t dns_server,
+int awg_proxy_start(uint16_t port, uint32_t dns_server,
                     const char *log_path);
 
 /*
@@ -42,11 +47,24 @@ int awg_proxy_start(uint32_t bind_ip, uint16_t port, uint32_t dns_server,
  */
 void awg_proxy_poll(int timeout_ms);
 
+/* Slots currently in use, out of the fixed table. */
+uint32_t awg_proxy_live(void);
+
+/* Table size, so the log can print occupancy as a fraction. */
+#define AWG_PROXY_MAX_CONN 16
+
 void awg_proxy_stop(void);
 
 /* Counters for the log. */
 typedef struct {
     uint32_t accepted;
+    uint32_t denied;        /* refused by the hostname deny list */
+    uint32_t refused;       /* turned away because the table was full */
+    uint32_t timed_out;     /* reclaimed by the idle sweep */
+    /* Every close that was not a clean finish: the client hung up, a read or
+     * write failed, the deny list or the idle sweep took it. Without this,
+     * accepted - completed - failed looks like a leak when it is not. */
+    uint32_t closed;
     uint32_t resolved;
     uint32_t connected;
     uint32_t completed;

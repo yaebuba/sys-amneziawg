@@ -1,32 +1,45 @@
-# sys-amneziawg : which hostnames travel through the tunnel
+# sys-amneziawg : dns.mitm host redirection
 #
-# Copy to /atmosphere/hosts/emummc_XXXXXXXX.txt, replacing XXXXXXXX with the
-# emummc id from /emuMMC/emummc.ini (the "id" field, without the 0x).
-# On a sysNAND setup, use default.txt instead.
+# Two jobs, and the first one matters more than the second.
 #
-# Replace 192.168.1.10 with the console's own LAN address, and reserve that
-# address on the router - a new DHCP lease breaks this file silently.
+# 1. Nintendo's telemetry endpoints stay blocked. Atmosphere adds these by
+#    default, but a hosts file of our own is exactly the situation where that
+#    protection gets lost by accident, so they are written out explicitly.
+#    Do not remove them.
 #
-# Only the hostnames listed here go through the tunnel. Everything else is
-# untouched. A hostname listed here is unreachable while the tunnel is down.
+#    Note that sys-amneziawg listens on 127.0.0.1:443, so these names now
+#    reach a port that answers. The module refuses them by name - see the
+#    deny list in awg_proxy.c - and counts them as deny= in the log. The
+#    block holds, but it holds because of that list, not because the address
+#    goes nowhere.
+#
+# 2. The hostnames sys-amneziawg proxies point at 127.0.0.1, where the module
+#    is listening. It reads the name out of the TLS ClientHello and opens the
+#    real connection through the tunnel.
+#
+# Loopback is deliberate. The console's own LAN address used to go here, and
+# it was wrong twice over: it changes with the network - a new DHCP lease,
+# the dock's wired link, a phone hotspot - and while the module was bound to
+# it, anything else on the same Wi-Fi could use the console as an open proxy
+# into the tunnel. 127.0.0.1 is the same everywhere and reachable only from
+# the console itself. Nothing here needs editing when the network changes.
 
-# Nintendo telemetry stays blocked. Atmosphere blocks it by default, but a
-# hosts file of your own is where that protection tends to get lost.
+# --- Nintendo telemetry: leave this alone ---
 127.0.0.1 receive-lp1.dg.srv.nintendo.net
 127.0.0.1 receive-lp1.er.srv.nintendo.net
 
-# Package downloads (aio-switch-updater and anything else pulling from GitHub)
-192.168.1.10 github.com
-192.168.1.10 api.github.com
-192.168.1.10 codeload.github.com
-192.168.1.10 raw.githubusercontent.com
-192.168.1.10 objects.githubusercontent.com
-192.168.1.10 release-assets.githubusercontent.com
+# --- proxied through the tunnel ---
+127.0.0.1 github.com
+127.0.0.1 api.github.com
+127.0.0.1 codeload.github.com
+127.0.0.1 raw.githubusercontent.com
+127.0.0.1 objects.githubusercontent.com
+127.0.0.1 release-assets.githubusercontent.com
 
-# YouTube
-192.168.1.10 youtube.com
-192.168.1.10 www.youtube.com
-192.168.1.10 m.youtube.com
-192.168.1.10 youtubei.googleapis.com
-192.168.1.10 i.ytimg.com
-192.168.1.10 *.googlevideo.com
+# --- YouTube: dns.mitm supports wildcards, and the video CDN uses many names ---
+127.0.0.1 youtube.com
+127.0.0.1 www.youtube.com
+127.0.0.1 m.youtube.com
+127.0.0.1 youtubei.googleapis.com
+127.0.0.1 i.ytimg.com
+127.0.0.1 *.googlevideo.com

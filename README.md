@@ -11,11 +11,13 @@ left alone.
 server. Traffic is selected by hostname; system-wide socket interception is not
 implemented.
 
+Questions, bug reports and release notes: [t.me/oneth1nq](https://t.me/oneth1nq).
+
 ## How it works
 
-Atmosphère's `dns.mitm` answers the hostnames you list with the console's own
-LAN address. The application opens what it thinks is an ordinary connection,
-and the module accepts it on port 443. From there the module reads the hostname
+Atmosphère's `dns.mitm` answers the hostnames you list with `127.0.0.1`. The
+application opens what it thinks is an ordinary connection, and the module
+accepts it on port 443. From there the module reads the hostname
 out of the TLS ClientHello, resolves it inside the tunnel, connects to the real
 server through lwIP and AmneziaWG, and passes the bytes across.
 
@@ -33,8 +35,10 @@ AmneziaWG node is encrypted.
 - An AmneziaWG configuration exported from the AmneziaVPN client. `Endpoint`
   must be a literal IPv4 address — a hostname there cannot be resolved before
   the tunnel that would resolve it is up.
-- A fixed LAN address for the console, reserved on the router. A new DHCP lease
-  breaks the hosts file silently.
+
+Nothing here depends on the console's IP address: the module listens on
+loopback, which is the same on every network. Moving between Wi-Fi, the dock's
+wired link and a phone hotspot needs no changes.
 
 Back up your SD card before installing any system module.
 
@@ -60,12 +64,9 @@ a native WireGuard/AmneziaWG config and save it as:
 
 `awg.conf.example` lists every field that is read and the format expected.
 
-**3. Fix the console's address.** Find it under Settings → Internet →
-Connection Status, then reserve it for the console on your router.
-
-**4. List the hostnames.** Copy `hosts.example.txt` to the SD card, replacing
-`192.168.1.10` with the console's address and listing the hostnames you want
-tunnelled. The filename depends on how you boot:
+**3. List the hostnames.** Copy `hosts.example.txt` to the SD card and add the
+hostnames you want tunnelled, each pointing at `127.0.0.1`. The filename
+depends on how you boot:
 
 | Setup   | File                                 |
 | ------- | ------------------------------------ |
@@ -78,9 +79,11 @@ place.
 
 Keep the Nintendo telemetry lines in the example. Atmosphère blocks telemetry by
 default, but a hosts file of your own is where that protection tends to get
-lost.
+lost. Those lines point at `127.0.0.1` too, which is a port the module now
+answers on — it refuses Nintendo's hostnames by name and counts them as `deny=`
+in the log, so the block still holds.
 
-**5. Reboot.** The module waits 15 seconds to stay out of the boot's way, waits
+**4. Reboot.** The module waits 15 seconds to stay out of the boot's way, waits
 for the network, brings the tunnel up and starts logging.
 
 ## Checking that it works
@@ -98,21 +101,23 @@ timers: rekey 120s, keepalive 30s, retry 7s
 [  0s] handshake initial attempt 1: sendto=1261
 [  0s] session up (handshake #1, rekeys 0)
 [  0s] lwip interface up on the tunnel
-[  0s] proxy listening on :443
+[  0s] proxy listening on 127.0.0.1:443
         proxy: raw.githubusercontent.com
-[ 15s] up=14s tx=1137 rx=1952 ka=0 fetches 1/1 | proxy conns=2 ok=1 fail=0 up=2KB down=1978KB
+[ 15s] up=14s tx=1137 rx=1952 ka=0 fetches 1/1 | proxy conns=2 ok=1 fail=0 closed=1 live=0/16 deny=0 full=0 idle=0 up=2KB down=1978KB
         rate 169KB/s (129 pkt/s) | tcp xmit=1137 recv=1952 drop=0 memerr=0 | ip drop=0 | pbuf err=0
 ```
 
 | Entry                     | Meaning                                                             |
 | ------------------------- | ------------------------------------------------------------------- |
-| `console ip:`             | Where the module accepts connections. Must match your hosts file.    |
+| `console ip:`             | The console's own LAN address. Informational; the proxy does not use it. |
 | `session up`              | The AmneziaWG handshake succeeded.                                   |
-| `proxy listening on :443` | The proxy is accepting connections from the console.                 |
+| `proxy listening on 127.0.0.1:443` | The proxy is accepting connections from the console.        |
 | `proxy: <host>`           | A hostname read out of a TLS ClientHello and sent through the tunnel.|
 | `up= tx= rx= ka=`         | Session age in seconds, then tunnel packets sent, received and keepalives. |
 | `fetches N/M`             | A built-in liveness check: N of M test HTTP requests through the tunnel succeeded. |
-| `conns / ok / fail`       | Proxied connections accepted, completed and failed.                  |
+| `conns / ok / fail / closed` | Proxied connections accepted, finished cleanly, failed to reach the server, and closed for any other reason. The four add up. |
+| `live=N/16`               | Slots in use. The table is fixed; at 16/16 new connections are refused. |
+| `deny / full / idle`      | Refused by name (Nintendo telemetry), refused because the table was full, and reclaimed after going quiet. |
 | `up=KB down=KB`           | Traffic carried by the proxy. The clearest sign that data is moving. |
 | `rate`                    | Current throughput. Roughly 200 KB/s is normal.                      |
 | `drop / memerr / pbuf err`| Should stay at 0. Anything else means the stack is running short of buffers. |
@@ -129,6 +134,7 @@ A status line is appended every 15 seconds. On shutdown the module writes a
 | Log stops at `boot: waiting for the network`| The console never reported a working connection. Check Wi-Fi and reboot.                         |
 | `handshake ... attempt N` repeats           | The endpoint is unreachable, or the keys and obfuscation values do not match the server.         |
 | `proxy FAILED to bind :443`                 | Another module or application already holds port 443. Disable it.                                |
+| Listed hosts stop working after a while     | Check `live=` in the log. At `16/16` the table is full and `full=` is climbing; report it.       |
 | Hosts file gone after a reboot              | Some bootloader packages overwrite `default.txt`. On emuMMC use the filename with your emuMMC ID.|
 | Nothing works after sleep                   | Sleep and wake are detected but not yet optimised. Reboot fully.                                 |
 
@@ -218,6 +224,9 @@ Session keys are never written to the log.
 
 Written by alik. Parts of the implementation were done together with Claude, an
 AI assistant made by Anthropic.
+
+Releases and discussion: [t.me/oneth1nq](https://t.me/oneth1nq) — the channel
+carries release notes, and its comments and direct messages are open.
 
 ## License
 

@@ -21,6 +21,7 @@
 #include <string.h>
 #include <errno.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <time.h>
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -321,6 +322,58 @@ int main(int argc, char **argv)
     }
     logf("endpoint: %s:%d\n", cfg.endpoint_host, cfg.endpoint_port);
 
+    /*
+     * Stage 6 probe: IPv6.
+     *
+     * Atmosphere's hosts files are IPv4 only, so if an application can reach
+     * a AAAA record on its own it leaves through the front door and we never
+     * see it. Whether that is a real hole or a theoretical one depends on
+     * whether this console has IPv6 connectivity at all, which nobody has
+     * checked. Opening the socket costs nothing and settles it.
+     */
+    {
+        int p6 = socket(AF_INET6, SOCK_STREAM, 0);
+        if (p6 < 0) {
+            logf("probe ipv6: socket() refused (errno=%d) - no IPv6 stack\n", errno);
+        } else {
+            struct sockaddr_in6 s6;
+            memset(&s6, 0, sizeof(s6));
+            s6.sin6_family = AF_INET6;
+            s6.sin6_port   = htons(80);
+            /* 2606:4700:4700::1111, Cloudflare's resolver. */
+            static const uint8_t cf[16] = {
+                0x26,0x06,0x47,0x00,0x47,0x00,0,0,0,0,0,0,0,0,0x11,0x11
+            };
+            memcpy(&s6.sin6_addr, cf, sizeof(cf));
+
+            /* Non-blocking, with a hard 3s ceiling: a blocking connect to an
+             * address with no route can sit there for the whole TCP timeout,
+             * and this runs before the tunnel comes up. A probe must never be
+             * able to delay the module. */
+            int fl = fcntl(p6, F_GETFL, 0);
+            if (fl >= 0) fcntl(p6, F_SETFL, fl | O_NONBLOCK);
+
+            int r = connect(p6, (struct sockaddr *)&s6, sizeof(s6));
+            int e = errno;
+            if (r < 0 && e == EINPROGRESS) {
+                struct pollfd pf = { .fd = p6, .events = POLLOUT };
+                if (poll(&pf, 1, 3000) > 0) {
+                    int so = 0; socklen_t sl = sizeof(so);
+                    if (getsockopt(p6, SOL_SOCKET, SO_ERROR, &so, &sl) == 0) {
+                        r = so == 0 ? 0 : -1;
+                        e = so;
+                    }
+                } else {
+                    e = ETIMEDOUT;
+                }
+            }
+            logf("probe ipv6: socket ok, connect=%d errno=%d%s\n",
+                    r, r < 0 ? e : 0,
+                    r == 0 ? "  <-- IPv6 REACHABLE, traffic can bypass us" : "");
+            close(p6);
+        }
+    }
+
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { logf("socket() failed errno=%d\n", errno); goto done; }
 
@@ -390,8 +443,8 @@ int main(int argc, char **argv)
                         (uint32_t)((now - start) / 1000));
 
                 uint32_t resolver = cfg.dns_n > 1 ? cfg.dns[1] : cfg.dns[0];
-                if (awg_proxy_start(myip, 443, resolver, LOG_PATH) == 0)
-                    logf("[%3us] proxy listening on :443\n",
+                if (awg_proxy_start(443, resolver, LOG_PATH) == 0)
+                    logf("[%3us] proxy listening on 127.0.0.1:443\n",
                             (uint32_t)((now - start) / 1000));
                 else
                     logf("[%3us] proxy FAILED to bind :443 (errno=%d)\n",
@@ -471,12 +524,15 @@ int main(int argc, char **argv)
             last_rx_pkts = sess.packets_rx;
             last_down_kb = (uint32_t)(ps.bytes_down / 1024);
             logf("[%3us] up=%us tx=%u rx=%u ka=%u fetches %u/%u | "
-                         "proxy conns=%u ok=%u fail=%u up=%lluKB down=%lluKB\n",
+                         "proxy conns=%u ok=%u fail=%u closed=%u live=%u/%u "
+                         "deny=%u full=%u idle=%u up=%lluKB down=%lluKB\n",
                     (uint32_t)((t - start) / 1000),
                     awg_session_age_s(&sess, t),
                     sess.packets_tx, sess.packets_rx, sess.keepalives_tx,
                     fetches_ok, fetches,
-                    ps.accepted, ps.completed, ps.failed,
+                    ps.accepted, ps.completed, ps.failed, ps.closed,
+                    awg_proxy_live(), (uint32_t)AWG_PROXY_MAX_CONN,
+                    ps.denied, ps.refused, ps.timed_out,
                     (unsigned long long)(ps.bytes_up / 1024),
                     (unsigned long long)(ps.bytes_down / 1024));
 
