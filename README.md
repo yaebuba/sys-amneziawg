@@ -7,9 +7,8 @@ module. It takes a configuration exported from the AmneziaVPN client and sends
 the hostnames you list through that tunnel. Everything else the console does is
 left alone.
 
-**Status: beta (v0.0.1).** The protocol is complete and verified against a live
-server. Traffic is selected by hostname; system-wide socket interception is not
-implemented.
+The protocol is complete and verified against a live server. Traffic is selected
+by hostname; system-wide socket interception is not implemented.
 
 Questions, bug reports and release notes: [t.me/oneth1nq](https://t.me/oneth1nq).
 
