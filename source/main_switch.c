@@ -35,6 +35,7 @@
 #include "awg_noise.h"
 #include "awg_session.h"
 #include "awg_netif.h"
+#include "awg_power.h"
 #include "awg_proxy.h"
 
 #include "lwip/tcp.h"
@@ -105,11 +106,16 @@ void __appInit(void)
     rc = nifmInitialize(NifmServiceType_User); if (R_FAILED(rc)) diagAbortWithResult(rc);
     rc = timeInitialize();               if (R_FAILED(rc)) diagAbortWithResult(rc);
     rc = socketInitialize(&g_sockCfg);   if (R_FAILED(rc)) diagAbortWithResult(rc);
+    /* Best effort, and deliberately not fatal: without it sleep goes
+     * unnoticed and recovery falls back to the socket dying, which is what
+     * this module did before. */
+    awg_power_start();
     smExit();
 }
 
 void __appExit(void)
 {
+    awg_power_stop();
     socketExit();
     timeExit();
     nifmExit();
@@ -449,24 +455,86 @@ int main(int argc, char **argv)
     uint64_t unreachable_since = 0; /* first send refused for want of a network */
     uint64_t next_rebuild = 0;      /* not before this, so a failure cannot spin */
     uint32_t rebuilds = 0;
+    uint64_t next_power = 0;        /* the play-event log is polled once a second */
+    uint32_t suspends = 0;          /* power transitions we tore the tunnel down for */
 
     while (!g_stop) {
         uint64_t now = now_ms();
         loops++;
 
         /*
-         * Recovery, and deliberately not "wake-up handling".
+         * Sleep: tear the tunnel down rather than let it survive.
          *
-         * There is no usable signal for a resume. Power events are out - psc:m
-         * hung the console - and the clock cannot stand in for them either:
-         * the monotonic counter keeps running while the console sleeps, so it
-         * stays in step with the wall clock and the drift this code used to
-         * watch for never appears. A forty-six second suspend went by without
-         * moving it a tick.
+         * The console can stay online while it sleeps - "keep wired connection
+         * in sleep mode" in the dock does exactly that - and then the socket
+         * outlives the suspend. A session that comes back that way carries the
+         * old keys and counters, and nothing crossed the tunnel to explain the
+         * gap. Nothing useful is lost by dropping it: game downloads go to
+         * Nintendo's servers, which this module never carries.
          *
-         * What is observable is the socket: it comes back dead. So rebuild on
-         * that, and sleep, a dropped Wi-Fi link and a move into the dock are
-         * all the same event, none of which we have to be able to tell apart.
+         * The signal usually arrives after the wake, because every process is
+         * frozen moments into the suspend. Acting on it late is still right -
+         * it says the tunnel was left unattended, which is reason enough to
+         * throw the keys away and handshake again.
+         */
+        if (now >= next_power) {
+            next_power = now + 1000;
+
+            /*
+             * One sleep writes an entry on the way down and another on the way
+             * back, and they are as far apart as the sleep was long - thirty-six
+             * seconds in one measured case - so no time window collapses them.
+             * A running tunnel is the thing worth reacting to: if it is already
+             * down, the transition says nothing the rebuild below is not doing
+             * anyway, and acting on it only restarts a handshake in progress.
+             */
+            if (awg_power_transition()) {
+                /*
+                 * Every elapsed time measured before the suspend is now
+                 * meaningless. The monotonic clock runs through sleep, so a
+                 * wait that began before it comes back inflated by however
+                 * long the console was away - one twenty-seven minute sleep
+                 * turned "no network for 39s" into "no network for 1606s" and
+                 * spent a rebuild on it. Start the wait again from the wake.
+                 */
+                unreachable_since = 0;
+
+                if (sess.established && !tunnel_lost) {
+                    suspends++;
+                    logf("[%3us] power transition (#%u) - dropping the tunnel\n",
+                            (uint32_t)((now - start) / 1000), suspends);
+
+                    awg_proxy_stop();
+                    if (fd >= 0) close(fd);
+                    fd = -1;
+                    awg_netif_set_fd(-1);   /* lwIP must not write to a closed one */
+                    awg_session_wipe(&sess);
+                    tunnel_lost = true;
+                } else {
+                    /* Worth a line even so: without one, a sleep that began
+                     * with the tunnel already down leaves no trace in the log
+                     * at all, and the gap looks like the module hanging. */
+                    logf("[%3us] power transition - tunnel already down, "
+                         "leaving it to the rebuild\n",
+                            (uint32_t)((now - start) / 1000));
+                }
+            }
+        }
+
+        /*
+         * Rebuilding, from either cause.
+         *
+         * The play-event log above says a suspend happened, but it is not the
+         * only way to lose the tunnel: a dropped Wi-Fi link and a move into
+         * the dock leave the socket dead with no power event at all, and the
+         * clock cannot stand in for one either - the monotonic counter keeps
+         * running through a suspend, so the drift this code once watched for
+         * never appears. A forty-six second sleep went by without moving it a
+         * tick.
+         *
+         * So both signals lead here, and neither has to be told apart from
+         * the other: whatever the cause, the answer is a new socket and a new
+         * handshake.
          */
         if (tunnel_lost && now >= next_rebuild) {
             /* Set before anything can fail, so every path out of here waits. */
@@ -488,6 +556,7 @@ int main(int argc, char **argv)
                 g_http = HTTP_IDLE;
                 next_fetch = 0;
                 tunnel_lost = false;
+                unreachable_since = 0;
                 logf("[%3us] tunnel rebuilt (#%u) - new socket, handshaking again\n",
                         (uint32_t)((now - start) / 1000), rebuilds);
 
@@ -500,12 +569,8 @@ int main(int argc, char **argv)
             }
         }
 
-        /*
-         * Resume detection by watching the clock rather than subscribing to
-         * power events. Registering with psc:m put this module in the path of
-         * every power transition and hung the console; a comparison costs
-         * nothing and cannot wedge anything.
-         */
+        /* Only for the heartbeat file - the clock says nothing about sleep,
+         * because the monotonic counter keeps running through it. */
         uint64_t wall = awg_now_seconds();
 
         if (now >= next_alive) {
@@ -513,7 +578,9 @@ int main(int argc, char **argv)
             alive_mark(now, wall, loops, netif_up ? "up" : "down");
         }
 
-        if (awg_session_needs_handshake(&sess, &cfg, now)) {
+        if (fd < 0) {
+            /* Torn down and not yet rebuilt: nothing below can send. */
+        } else if (awg_session_needs_handshake(&sess, &cfg, now)) {
             int n = awg_session_build_initiation(&sess, &cfg, g_wire,
                                                  (int)sizeof(g_wire), now);
             if (n > 0) {
@@ -705,14 +772,24 @@ int main(int argc, char **argv)
             /* Rates, not totals: a total tells you nothing about whether the
              * transfer is moving now. */
             static uint32_t last_rx_pkts = 0, last_down_kb = 0;
-            uint32_t d_pkts = sess.packets_rx - last_rx_pkts;
-            uint32_t d_kb   = (uint32_t)(ps.bytes_down / 1024) - last_down_kb;
-            last_rx_pkts = sess.packets_rx;
-            last_down_kb = (uint32_t)(ps.bytes_down / 1024);
+            uint32_t now_pkts = sess.packets_rx;
+            uint32_t now_kb   = (uint32_t)(ps.bytes_down / 1024);
+
+            /*
+             * Both counters restart at zero when the tunnel is rebuilt, and
+             * subtracting the old baseline from the new total underflows: one
+             * run reported 286330992KB/s across the rebuild. A total that has
+             * gone backwards means the thing counting it started over, and
+             * the honest rate for that interval is nothing.
+             */
+            uint32_t d_pkts = now_pkts >= last_rx_pkts ? now_pkts - last_rx_pkts : 0;
+            uint32_t d_kb   = now_kb   >= last_down_kb ? now_kb   - last_down_kb : 0;
+            last_rx_pkts = now_pkts;
+            last_down_kb = now_kb;
             logf("[%3us] up=%us tx=%u rx=%u ka=%u fetches %u/%u | "
                          "proxy conns=%u ok=%u fail=%u closed=%u live=%u/%u "
                          "deny=%u full=%u idle=%u up=%lluKB down=%lluKB "
-                         "loops=%llu stray=%u replay=%u\n",
+                         "loops=%llu stray=%u replay=%u rebuilds=%u sleep=%u\n",
                     (uint32_t)((t - start) / 1000),
                     awg_session_age_s(&sess, t),
                     sess.packets_tx, sess.packets_rx, sess.keepalives_tx,
@@ -723,7 +800,30 @@ int main(int argc, char **argv)
                     (unsigned long long)(ps.bytes_up / 1024),
                     (unsigned long long)(ps.bytes_down / 1024),
                     (unsigned long long)loops, stray_datagrams,
-                    sess.replays_dropped);
+                    sess.replays_dropped, rebuilds, suspends);
+
+            /* One line per new drop, so a duplicate and a packet the window
+             * was too narrow to judge do not look the same in the log. */
+            {
+                static uint32_t reported = 0;
+                /*
+                 * Strictly greater, and the baseline follows the counter down.
+                 * A rebuild reinitialises the session, so this count returns
+                 * to zero while the old high-water mark stays behind - and an
+                 * inequality test then reports a drop that never happened,
+                 * printing the freshly zeroed fields as though they meant
+                 * something. Same shape of mistake as the rate line above.
+                 */
+                if (sess.replays_dropped > reported) {
+                    logf("        replay: counter %llu, %llu behind, %s%s\n",
+                            (unsigned long long)sess.last_replay_ctr,
+                            (unsigned long long)sess.last_replay_behind,
+                            sess.last_replay_old ? "outside the window (reordering)"
+                                                 : "duplicate inside the window",
+                            sess.last_replay_prev ? ", on the retired keypair" : "");
+                }
+                reported = sess.replays_dropped;
+            }
 
             /*
              * Only once lwIP is actually running: its statistics pointers are

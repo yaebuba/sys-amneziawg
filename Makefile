@@ -47,7 +47,7 @@ export VPATH    := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
                    $(foreach dir,$(DATA),$(CURDIR)/$(dir))
 export DEPSDIR  := $(CURDIR)/$(BUILD)
 
-CFILES   := awg_obf.c awg_config.c awg_rand.c awg_noise.c awg_ipprobe.c awg_session.c \
+CFILES   := awg_obf.c awg_config.c awg_rand.c awg_noise.c awg_ipprobe.c awg_session.c awg_power.c \
             awg_netif.c main_switch.c \
             blake2s.c chacha20.c chacha20poly1305.c poly1305-donna.c x25519.c crypto.c \
             sys_arch.c \

@@ -82,7 +82,12 @@ lost. Those lines point at `127.0.0.1` too, which is a port the module now
 answers on — it refuses Nintendo's hostnames by name and counts them as `deny=`
 in the log, so the block still holds.
 
-**4. Reboot.** The module waits 15 seconds to stay out of the boot's way, waits
+**4. Turn off sleep-mode networking.** In **System Settings → Sleep Mode**,
+switch **Keep wired connection in sleep mode** off. Nothing breaks if you leave
+it on today, but see [Sleep, and the dock](#sleep-and-the-dock) for why the
+habit is worth having now.
+
+**5. Reboot.** The module waits 15 seconds to stay out of the boot's way, waits
 for the network, brings the tunnel up and starts logging.
 
 ## Checking that it works
@@ -97,13 +102,17 @@ console ip: 192.168.1.10
 endpoint: 203.0.113.10:51820
 timers: rekey 120s, keepalive 30s, retry 7s
 
-[  0s] handshake initial attempt 1: sendto=1261
+[  0s] handshake initial attempt 1: sendto=1261 errno=0
 [  0s] session up (handshake #1, rekeys 0)
 [  0s] lwip interface up on the tunnel
 [  0s] proxy listening on 127.0.0.1:443
         proxy: raw.githubusercontent.com
-[ 15s] up=14s tx=1137 rx=1952 ka=0 fetches 1/1 | proxy conns=2 ok=1 fail=0 closed=1 live=0/16 deny=0 full=0 idle=0 up=2KB down=1978KB
+[ 15s] up=14s tx=1137 rx=1952 ka=0 fetches 1/1 | proxy conns=2 ok=1 fail=0 closed=1 live=0/16 deny=0 full=0 idle=0 up=2KB down=1978KB loops=152 stray=0 replay=0 rebuilds=0 sleep=0
         rate 169KB/s (129 pkt/s) | tcp xmit=1137 recv=1952 drop=0 memerr=0 | ip drop=0 | pbuf err=0
+[ 17s] power transition (#1) - dropping the tunnel
+[112s] tunnel rebuilt (#2) - new socket, handshaking again
+[113s] power transition - tunnel already down, leaving it to the rebuild
+[119s] session up (handshake #1, rekeys 0)
 ```
 
 | Entry                     | Meaning                                                             |
@@ -120,6 +129,12 @@ timers: rekey 120s, keepalive 30s, retry 7s
 | `up=KB down=KB`           | Traffic carried by the proxy. The clearest sign that data is moving. |
 | `rate`                    | Current throughput. Roughly 200 KB/s is normal.                      |
 | `drop / memerr / pbuf err`| Should stay at 0. Anything else means the stack is running short of buffers. |
+| `stray=N`                 | Datagrams that arrived from somewhere other than the configured server, and were dropped. Should stay at 0. |
+| `replay=N`                | Authenticated datagrams refused because their counter could not be shown to be new. A handful over a long session is ordinary; each one prints a `replay:` line saying whether it was a duplicate or arrived too late to judge. |
+| `rebuilds=N` / `sleep=N`  | Tunnels rebuilt, and sleeps noticed. Both climb during normal use — see below. |
+| `tunnel socket died`      | The socket stopped working: a sleep, a dropped Wi-Fi link, or a move into the dock. The module rebuilds and handshakes again on its own. |
+| `power transition`        | The console slept. The tunnel is dropped and its keys wiped, so no session survives a sleep. If it was already down, the log says so and the rebuild handles it. |
+| `no network for Ns`       | Sending was refused for want of a link. After thirty seconds the module spends one rebuild to rule out a socket that will never work. |
 
 A status line is appended every 15 seconds. On shutdown the module writes a
 `=== summary ===` and a `=== verdict ===` block with the totals for the run.
@@ -135,7 +150,9 @@ A status line is appended every 15 seconds. On shutdown the module writes a
 | `proxy FAILED to bind :443`                 | Another module or application already holds port 443. Disable it.                                |
 | Listed hosts stop working after a while     | Check `live=` in the log. At `16/16` the table is full and `full=` is climbing; report it.       |
 | Hosts file gone after a reboot              | Some bootloader packages overwrite `default.txt`. On emuMMC use the filename with your emuMMC ID.|
-| Nothing works after sleep                   | Sleep and wake are detected but not yet optimised. Reboot fully.                                 |
+| Nothing works for a moment after sleep      | The tunnel rebuilds itself, but Wi-Fi takes a few seconds to come back. Give it half a minute before rebooting. |
+| A long gap between log entries              | The console was asleep; every process is frozen, this one included. The lines either side of the gap say `power transition`.                     |
+| Listed hosts fail while docked and asleep   | Expected. Turn off **System Settings → Sleep Mode → Keep wired connection in sleep mode**; see below.                                            |
 
 To go back to normal behaviour, delete or rename the hosts file. Nothing else
 needs to be touched.
@@ -145,14 +162,43 @@ needs to be touched.
 - TCP on port 443 only. UDP and QUIC are not carried.
 - Only the hostnames in the hosts file. All other traffic is untouched.
 - One server per configuration: no switching on the fly, no subscriptions.
-- Sleep and wake are detected but not yet optimised.
+- The tunnel is dropped on sleep and rebuilt on wake; nothing runs while the
+  console is asleep. Keep wired connection in sleep mode should be off — see
+  below.
 - No overlay or interface; state goes to the log file.
 - Throughput depends on the server, Wi-Fi and tunnel settings. Around 200 KB/s
   is what this build currently reaches.
 
+### Sleep, and the dock
+
+**Turn off System Settings → Sleep Mode → Keep wired connection in sleep mode
+while you use this module.**
+
+Every system module is frozen while the console sleeps, this one included. The
+module drops the tunnel as soon as it notices a power transition — the keys are
+wiped, the socket is closed, and a fresh handshake runs on the next wake — so a
+session never quietly survives a sleep it could not watch.
+
+Nothing leaks with the setting either way. The hostnames you listed still
+resolve to `127.0.0.1`, and with the module frozen those connections fail rather
+than going out around the tunnel. Downloads from the eShop are unaffected: they
+go to Nintendo servers, which the hosts file does not redirect.
+
+So today the setting costs you nothing but a failed connection, and the advice
+above is a recommendation rather than a requirement. It is here so the habit is
+already in place before it matters. Once traffic is captured at the socket level
+instead of by hostname, a frozen module will mean a frozen network for the whole
+console — and that is exactly the case where the console would otherwise be
+awake and using it.
+
 ## Building
 
 Requires devkitPro with devkitA64 and libnx.
+
+The module asks for `pdm:qry` in `sys-amneziawg.json`, which is how it
+notices that the console slept. Removing it from the service list costs
+nothing else, but sleep then goes unnoticed and the tunnel is only rebuilt
+once its socket dies.
 
 ```sh
 export DEVKITPRO=/opt/devkitpro
@@ -202,6 +248,7 @@ required.
 | `source/awg_config.c`   | `.conf` parser.                                               |
 | `source/awg_session.c`  | Session state, timers, key rotation, keepalives.              |
 | `source/awg_netif.c`    | The lwIP network interface sitting on the tunnel.             |
+| `source/awg_power.c`    | Notices that the console slept, by reading the play-event log.|
 | `source/awg_proxy.c`    | The SNI proxy between console sockets and lwIP.               |
 | `source/main_switch.c`  | System module entry point, main loop and logging.             |
 | `source/main_host.c`    | Host harness entry point.                                     |

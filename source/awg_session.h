@@ -81,6 +81,17 @@ typedef struct {
     uint64_t      prev_window_bits;
     uint64_t      prev_since_ms;    /* when the old keypair was retired */
     uint32_t      replays_dropped;  /* datagrams that decrypted but repeated */
+    /*
+     * Why the last drop happened. A duplicate arriving inside the window is a
+     * duplicate - a network that delivered the same datagram twice, or
+     * somebody replaying it. One that fell outside is reordering the window
+     * was too narrow to judge. They call for opposite responses, and the
+     * count alone cannot tell them apart.
+     */
+    uint64_t      last_replay_ctr;
+    uint64_t      last_replay_behind;
+    bool          last_replay_old;   /* fell outside the window, not a duplicate */
+    bool          last_replay_prev;  /* arrived on the retired keypair */
 
     uint64_t      established_ms;
     uint64_t      last_tx_ms;
@@ -131,6 +142,7 @@ int awg_session_build_keepalive(awg_session *s, const awg_config *cfg,
  * packet and `*payload_len` its length. `pkt` is modified in place.
  */
 void awg_session_wipe(awg_session *s);
+
 
 awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
                                       uint8_t *pkt, int pkt_len,

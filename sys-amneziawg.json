@@ -22,7 +22,8 @@
     "set:sys",
     "time:s",
     "time:u",
-    "time:a"
+    "time:a",
+    "pdm:qry"
   ],
   "service_host": [],
   "kernel_capabilities": [

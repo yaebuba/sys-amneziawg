@@ -120,6 +120,10 @@ void awg_session_wipe(awg_session *s)
  */
 #define REPLAY_WINDOW 64
 
+/* Set when a drop happens, so the caller can say which kind it was. */
+static uint64_t g_replay_behind;
+static bool     g_replay_too_old;
+
 static bool replay_ok(uint64_t *max, uint64_t *bits, uint64_t ctr)
 {
     if (ctr > *max) {
@@ -133,10 +137,17 @@ static bool replay_ok(uint64_t *max, uint64_t *bits, uint64_t ctr)
     }
 
     uint64_t behind = *max - ctr;
-    if (behind >= REPLAY_WINDOW) return false;      /* too old to judge */
+    g_replay_behind = behind;
+    if (behind >= REPLAY_WINDOW) {
+        g_replay_too_old = true;
+        return false;                               /* too old to judge */
+    }
 
     uint64_t bit = 1ULL << behind;
-    if (*bits & bit) return false;                  /* seen it already */
+    if (*bits & bit) {
+        g_replay_too_old = false;
+        return false;                               /* seen it already */
+    }
 
     *bits |= bit;
     return true;
@@ -216,16 +227,17 @@ awg_rx_result awg_session_on_datagram(awg_session *s, const awg_config *cfg,
     if (plain < 0) return AWG_RX_IGNORED;
 
     /* Authenticated, but not yet proven new. */
-    if (on_prev) {
-        if (!replay_ok(&s->prev_window_max, &s->prev_window_bits, ctr)) {
-            s->replays_dropped++;
-            return AWG_RX_IGNORED;
-        }
-    } else {
-        if (!replay_ok(&s->rx_window_max, &s->rx_window_bits, ctr)) {
-            s->replays_dropped++;
-            return AWG_RX_IGNORED;
-        }
+    bool fresh = on_prev
+        ? replay_ok(&s->prev_window_max, &s->prev_window_bits, ctr)
+        : replay_ok(&s->rx_window_max,   &s->rx_window_bits,   ctr);
+
+    if (!fresh) {
+        s->replays_dropped++;
+        s->last_replay_ctr    = ctr;
+        s->last_replay_behind = g_replay_behind;
+        s->last_replay_old    = g_replay_too_old;
+        s->last_replay_prev   = on_prev;
+        return AWG_RX_IGNORED;
     }
 
     s->last_rx_ms = now_ms;
